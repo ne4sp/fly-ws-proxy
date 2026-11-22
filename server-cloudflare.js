@@ -34,8 +34,54 @@ function splitList(s) {
   return String(s).split(",").map((x) => x.trim()).filter(Boolean);
 }
 
+function normalizeIPv6Literal(host) {
+  const value = String(host).trim();
+  return value.startsWith("[") && value.endsWith("]")
+    ? value.slice(1, -1)
+    : value;
+}
+
+function isIPv6Literal(host) {
+  const value = normalizeIPv6Literal(host);
+  if (!value.includes(":") || value.includes("[") || value.includes("]")) return false;
+  if (value.includes("%")) return false;
+
+  const doubleColonCount = value.split("::").length - 1;
+  if (doubleColonCount > 1) return false;
+
+  const ipParts = value.split("::");
+  if (doubleColonCount === 0 && ipParts.length !== 1) return false;
+
+  const countGroups = (part) => {
+    if (!part) return 0;
+    const groups = part.split(":");
+    let count = 0;
+    for (const group of groups) {
+      if (/^([0-9a-f]{1,4})$/i.test(group)) {
+        count += 1;
+      } else if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(group)) {
+        const octets = group.split(".").map(Number);
+        if (octets.some((octet) => octet > 255)) return -1;
+        count += 2;
+      } else {
+        return -1;
+      }
+    }
+    return count;
+  };
+
+  const leftCount = countGroups(ipParts[0]);
+  if (leftCount < 0) return false;
+
+  if (doubleColonCount === 0) return leftCount === 8;
+
+  const rightCount = ipParts.length === 2 ? countGroups(ipParts[1]) : -1;
+  if (rightCount < 0) return false;
+  return leftCount + rightCount < 8;
+}
+
 async function resolve4(host) {
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return host;
+  if (isIPv6Literal(host) || /^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return host;
   const hit = fresh(dns, host);
   if (hit) return hit.ip;
   const r = await fetch("https://cloudflare-dns.com/dns-query?type=A&name=" + encodeURIComponent(host), {
@@ -75,10 +121,22 @@ async function probe(target, host) {
 }
 
 async function diagnose(host, prefixes) {
-  const [direct, ip] = await Promise.all([probe(host, host), resolve4(host).catch((e) => ({ error: String(e) }))]);
+  const normalizedHost = normalizeIPv6Literal(host);
+  const isV6 = isIPv6Literal(normalizedHost);
+  const [direct, ip] = await Promise.all([
+    probe(normalizedHost, normalizedHost),
+    isV6
+      ? Promise.resolve(normalizedHost)
+      : resolve4(normalizedHost).catch((e) => ({ error: String(e) })),
+  ]);
   if (typeof ip !== "string") return [direct, { resolve: ip.error }];
   const out = [];
-  out.push(direct, { ipv4: ip });
+  out.push(direct, isV6 ? { ipv6: ip } : { ipv4: ip });
+  if (isV6) {
+    const route = fresh(routes, normalizedHost);
+    out.push({ cache: { route: route ? route.prefix || "direct" : null, lastGood } });
+    return out;
+  }
   for (let i = 0; i < prefixes.length; i += 5) {
     out.push(...(await Promise.all(prefixes.slice(i, i + 5).map((p) => probe(toNat64(p, ip), host)))));
   }
@@ -88,16 +146,21 @@ async function diagnose(host, prefixes) {
 }
 
 function relay(ws, host, port, prefixes) {
-  const route = fresh(routes, host);
+  const normalizedHost = normalizeIPv6Literal(host);
+  const isV6 = isIPv6Literal(normalizedHost);
+  const route = fresh(routes, normalizedHost);
   const pending = [];
   const live = new Set();
   let winner = null, closed = false, firstAt = 0;
   let queue = [], limit = 1, staggerTimer = null, ipP = null;
 
-  const getIp = () => ipP || (ipP = resolve4(host));
-  const direct = async () => [{ target: host, prefix: null }];
+  const getIp = () => {
+    if (isV6) return Promise.resolve(normalizedHost);
+    return ipP || (ipP = resolve4(normalizedHost));
+  };
+  const direct = async () => [{ target: normalizedHost, prefix: null }];
   const nat64 = async () => {
-    if (!prefixes.length) return [];
+    if (!prefixes.length || isV6) return [];
     const ip = await getIp();
     const order = new Set([route && route.prefix, lastGood, ...prefixes].filter((p) => prefixes.includes(p)));
     return [...order].map((p) => ({ target: toNat64(p, ip), prefix: p }));
@@ -248,7 +311,7 @@ export default {
     }
 
     if (!authed) return new Response("Forbidden", { status: 403 });
-    const host = arg("h").toLowerCase();
+    const host = normalizeIPv6Literal(arg("h").toLowerCase());
     const port = parseInt(arg("p") || "443", 10);
     if (!/^[a-z0-9.\-:]{1,253}$/.test(host) || !(port > 0 && port < 65536) || port === 25) {
       return new Response("Bad Request", { status: 400 });
