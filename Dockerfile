@@ -1,44 +1,14 @@
-# syntax = docker/dockerfile:1
-
-# Adjust NODE_VERSION as desired
 ARG NODE_VERSION=24.22.0
-FROM node:${NODE_VERSION}-slim AS base
+FROM node:${NODE_VERSION}-slim
 
 LABEL fly_launch_runtime="Node.js"
 
-# Node.js app lives here
-WORKDIR /app
-
-# Set production environment
+WORKDIR /
 ENV NODE_ENV="production"
 
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY server.js server-cloudflare.js ./
 
-# Throw-away build stage to reduce size of final image
-FROM base AS build
-
-# Install packages needed to build node modules
-RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y build-essential node-gyp pkg-config python-is-python3
-
-# Install node modules
-COPY package.json ./
-RUN npm install
-
-# Copy application code
-COPY . .
-
-
-# Final stage for app image
-FROM base
-
-# Copy built application
-WORKDIR /
-COPY --from=build /app/package.json ./package.json
-COPY --from=build /app/package-lock.json ./package-lock.json
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/server.js ./server.js
-COPY --from=build /app/server-cloudflare.js ./server-cloudflare.js
-
-# Start the server by default, this can be overwritten at runtime
 EXPOSE 8080
-CMD [ "npm", "run", "start" ]
+CMD ["npm", "run", "start"]
