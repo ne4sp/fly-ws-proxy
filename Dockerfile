@@ -32,7 +32,12 @@ COPY . .
 FROM base
 
 # Copy built application
-COPY --from=build /app /app
+WORKDIR /
+COPY --from=build /app/package.json ./package.json
+COPY --from=build /app/package-lock.json ./package-lock.json
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/server.js ./server.js
+COPY --from=build /app/server-cloudflare.js ./server-cloudflare.js
 
 # Start the server by default, this can be overwritten at runtime
 EXPOSE 8080
